@@ -55,8 +55,8 @@ jobs:
           echo "==== AFTER PATCH ===="
           ls -lah
 
-            - name: Collect outputs (include patched JAR if modified + PIF module)
-          run: |
+      - name: Collect outputs (include patched JAR if modified + PIF module)
+        run: |
           set -e
           START_TIME=$(cat _start_time)
           mkdir -p outputs
@@ -100,7 +100,6 @@ jobs:
           echo "== OUTPUTS =="
           ls -lah outputs
           tar -czf outputs-${{ env.OUT_TAG }}.tar.gz -C outputs .
-
 
       - name: Upload artifacts (download from this run)
         uses: actions/upload-artifact@v4

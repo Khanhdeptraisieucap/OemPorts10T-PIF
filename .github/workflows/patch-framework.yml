@@ -21,11 +21,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install dependencies (Java, zip tools, gdown; ensure zipalign)
         run: |
+          set -e
           sudo apt-get update
-          # zipalign cần có trên runner
-          sudo apt-get install -y openjdk-17-jre zip unzip jq curl gdown p7zip-full zipalign
+          sudo apt-get install -y openjdk-17-jre zip unzip jq curl p7zip-full python3-pip || true
+
+          # gdown via pip (APT không có gói gdown)
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --no-input gdown
+
+          # zipalign: thử APT trước, nếu không có thì tải build-tools (có zipalign)
+          if ! command -v zipalign >/dev/null 2>&1; then
+            echo "zipalign not found via APT, trying to install..."
+            sudo apt-get install -y zipalign || true
+          fi
+          if ! command -v zipalign >/dev/null 2>&1; then
+            echo "Downloading Android build-tools (contains zipalign)..."
+            VER=34.0.0
+            mkdir -p $HOME/android-build-tools
+            cd $HOME/android-build-tools
+            curl -L -o build-tools.zip "https://dl.google.com/android/repository/build-tools_r${VER}-linux.zip"
+            unzip -q build-tools.zip
+            echo "$HOME/android-build-tools/android-${VER}/" >> $GITHUB_PATH
+            echo "$HOME/android-build-tools/android-${VER}" >> $GITHUB_PATH
+            echo "PATH=$PATH:$HOME/android-build-tools/android-${VER}" >> $GITHUB_ENV
+            cd -
+          fi
+          echo "zipalign path: $(command -v zipalign || echo 'NOT FOUND')"
 
       - name: Download framework.jar from source Release
         env:
@@ -77,16 +100,14 @@ jobs:
           START_TIME=$(cat _start_time)
           mkdir -p outputs
 
-          # Luôn ưu tiên lấy framework.jar (nếu tồn tại sau patch)
-          if [ -f framework_patcher/framework.jar ]; then
-            cp -v framework_patcher/framework.jar outputs/framework_patched.jar
-          fi
-          # Nếu có file rebuild
+          # Ưu tiên lấy framework.jar sau patch (hoặc bản rebuild)
           if [ -f framework_patcher/framework_patched.jar ]; then
             cp -v framework_patcher/framework_patched.jar outputs/framework_patched.jar
+          elif [ -f framework_patcher/framework.jar ]; then
+            cp -v framework_patcher/framework.jar outputs/framework_patched.jar
           fi
 
-          # Gom module ZIP (nếu script xuất)
+          # Gom module ZIP (nếu có)
           shopt -s nullglob
           mods=(framework_patcher/*.zip *.zip)
           if [ ${#mods[@]} -gt 0 ]; then

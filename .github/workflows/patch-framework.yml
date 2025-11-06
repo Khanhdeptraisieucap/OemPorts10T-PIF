@@ -12,7 +12,8 @@ jobs:
   patch-and-release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # cần để tạo release & upload asset
+      contents: write   # cần để tạo/xóa release & upload asset
+
     env:
       SRC_TAG: ${{ github.event.inputs.tag }}
       REPO: ${{ github.repository }}
@@ -39,7 +40,6 @@ jobs:
           fi
           echo "✅ Downloading: $asset_url"
           curl -L "$asset_url" -o framework_patcher/framework.jar
-          ls -lh framework_patcher/
 
       - name: Make patch script executable
         run: chmod +x framework_patcher/patchframework.sh
@@ -48,7 +48,6 @@ jobs:
         working-directory: framework_patcher
         run: |
           set -e
-          # Ghi mốc thời gian trước khi patch để lọc file mới sinh ra
           date -u +"%Y-%m-%dT%H:%M:%SZ" > ../_start_time
           ./patchframework.sh
           echo "==== AFTER PATCH ===="
@@ -60,18 +59,13 @@ jobs:
           START_TIME=$(cat _start_time)
           mkdir -p outputs
 
-          echo "Start time: $START_TIME"
-
-          # Lấy mọi file tạo/sửa sau khi patch (loại trừ input & script)
           mapfile -t files < <(find framework_patcher -type f -newermt "$START_TIME" \
                                 ! -name "framework.jar" \
                                 ! -name "patchframework.sh" \
                                 ! -name "*.log" \
                                 ! -name "*.sh" 2>/dev/null)
 
-          # Fallback nếu mtime không khớp
           if [ ${#files[@]} -eq 0 ]; then
-            echo "⚠️  Không xác định được theo mốc thời gian, dùng fallback."
             mapfile -t files < <(find framework_patcher -type f \
                                   ! -name "framework.jar" \
                                   ! -name "patchframework.sh" \
@@ -79,21 +73,14 @@ jobs:
           fi
 
           if [ ${#files[@]} -eq 0 ]; then
-            echo "❌ Không tìm thấy file đầu ra. Danh sách file để debug:"
-            find framework_patcher -maxdepth 2 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort
+            echo "❌ Không tìm thấy file đầu ra."
             exit 1
           fi
 
-          echo "✅ Files to publish:"
-          printf '%s\n' "${files[@]}"
-
           cp -v "${files[@]}" outputs/
-          ls -lah outputs
-
-          # Gói tiện dụng
           tar -czf outputs-${{ env.OUT_TAG }}.tar.gz -C outputs .
 
-      - name: Upload artifacts (download/debug)
+      - name: Upload artifacts (debug)
         uses: actions/upload-artifact@v4
         with:
           name: patched-${{ env.OUT_TAG }}
@@ -101,22 +88,41 @@ jobs:
             outputs/
             outputs-${{ env.OUT_TAG }}.tar.gz
 
-      - name: Upload full patcher folder (debug)
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-framework_patcher-${{ env.OUT_TAG }}
-          path: framework_patcher/
+      #
+      # ✅ FIX: delete release + tag nếu tồn tại → tránh lỗi immutable
+      #
+      - name: Delete release if exists
+        continue-on-error: true
+        run: |
+          rel_id=$(curl -s -X GET "https://api.github.com/repos/${REPO}/releases/tags/${OUT_TAG}" | jq -r .id)
+          if [ "$rel_id" != "null" ]; then
+            echo "⚠️ Release existed → deleting..."
+            curl -s -X DELETE \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${REPO}/releases/$rel_id
+          fi
 
+      - name: Delete git tag if exists
+        continue-on-error: true
+        run: |
+          if git ls-remote --tags origin | grep -q "refs/tags/${OUT_TAG}"; then
+            echo "⚠️ Tag existed → deleting..."
+            curl -s -X DELETE \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${REPO}/git/refs/tags/${OUT_TAG}
+          fi
+
+      #
+      # ✅ Create new release (now allowed)
+      #
       - name: Create output Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.OUT_TAG }}
           name: Patched ${{ env.OUT_TAG }}
           body: |
-            Auto-patched from source tag **${{ env.SRC_TAG }}**.
-            This release is created by GitHub Actions.
-          draft: false
-          prerelease: false
+            Auto-patched from source tag **${{ env.SRC_TAG }}**
           files: |
             outputs/*
             outputs-${{ env.OUT_TAG }}.tar.gz
+

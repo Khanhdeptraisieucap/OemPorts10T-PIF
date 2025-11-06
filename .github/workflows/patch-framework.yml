@@ -1,4 +1,4 @@
-name: Patch framework from Release → Create output Release
+name: Patch framework from Release → Artifact only (no Release)
 
 on:
   workflow_dispatch:
@@ -9,11 +9,11 @@ on:
         default: 'v1'
 
 jobs:
-  patch-and-release:
+  patch-and-artifact:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # cần để tạo/xóa release & upload asset
-
+      contents: read    # chỉ cần đọc để tải release nguồn
+      actions: read     # đọc danh sách artifact của run (để in URL)
     env:
       SRC_TAG: ${{ github.event.inputs.tag }}
       REPO: ${{ github.repository }}
@@ -40,6 +40,7 @@ jobs:
           fi
           echo "✅ Downloading: $asset_url"
           curl -L "$asset_url" -o framework_patcher/framework.jar
+          ls -lh framework_patcher/
 
       - name: Make patch script executable
         run: chmod +x framework_patcher/patchframework.sh
@@ -48,6 +49,7 @@ jobs:
         working-directory: framework_patcher
         run: |
           set -e
+          # Ghi mốc thời gian để lọc file mới sinh
           date -u +"%Y-%m-%dT%H:%M:%SZ" > ../_start_time
           ./patchframework.sh
           echo "==== AFTER PATCH ===="
@@ -59,13 +61,16 @@ jobs:
           START_TIME=$(cat _start_time)
           mkdir -p outputs
 
+          # Lấy mọi file tạo/sửa sau khi patch (loại trừ input & script)
           mapfile -t files < <(find framework_patcher -type f -newermt "$START_TIME" \
                                 ! -name "framework.jar" \
                                 ! -name "patchframework.sh" \
                                 ! -name "*.log" \
                                 ! -name "*.sh" 2>/dev/null)
 
+          # Fallback nếu mtime không khớp
           if [ ${#files[@]} -eq 0 ]; then
+            echo "⚠️  Fallback: quét toàn bộ thư mục."
             mapfile -t files < <(find framework_patcher -type f \
                                   ! -name "framework.jar" \
                                   ! -name "patchframework.sh" \
@@ -74,55 +79,53 @@ jobs:
 
           if [ ${#files[@]} -eq 0 ]; then
             echo "❌ Không tìm thấy file đầu ra."
+            find framework_patcher -maxdepth 2 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort
             exit 1
           fi
 
+          echo "✅ Files to publish:"
+          printf '%s\n' "${files[@]}"
+
           cp -v "${files[@]}" outputs/
+          ls -lah outputs
+
+          # Gói thêm 1 bản tar.gz cho tiện tải 1 file
           tar -czf outputs-${{ env.OUT_TAG }}.tar.gz -C outputs .
 
-      - name: Upload artifacts (debug)
+      - name: Upload artifacts (download from this run)
         uses: actions/upload-artifact@v4
         with:
           name: patched-${{ env.OUT_TAG }}
           path: |
             outputs/
             outputs-${{ env.OUT_TAG }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
 
-      #
-      # ✅ FIX: delete release + tag nếu tồn tại → tránh lỗi immutable
-      #
-      - name: Delete release if exists
-        continue-on-error: true
+      - name: Print direct Artifact URL
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          rel_id=$(curl -s -X GET "https://api.github.com/repos/${REPO}/releases/tags/${OUT_TAG}" | jq -r .id)
-          if [ "$rel_id" != "null" ]; then
-            echo "⚠️ Release existed → deleting..."
-            curl -s -X DELETE \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              https://api.github.com/repos/${REPO}/releases/$rel_id
+          run_id=${{ github.run_id }}
+          repo=${{ github.repository }}
+          # Lấy artifact id theo đúng tên
+          resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com/repos/$repo/actions/runs/$run_id/artifacts")
+          art_id=$(echo "$resp" | jq -r --arg NAME "patched-${OUT_TAG}" '.artifacts[] | select(.name==$NAME) | .id')
+          if [ -n "$art_id" ] && [ "$art_id" != "null" ]; then
+            echo ""
+            echo "================ ARTIFACT DOWNLOAD LINK ================"
+            echo "👉  https://github.com/$repo/actions/runs/$run_id/artifacts/$art_id"
+            echo "========================================================"
+            echo ""
+          else
+            echo "⚠️ Không tìm thấy artifact id để in URL. Vào tab Actions của run này để tải."
           fi
 
-      - name: Delete git tag if exists
-        continue-on-error: true
-        run: |
-          if git ls-remote --tags origin | grep -q "refs/tags/${OUT_TAG}"; then
-            echo "⚠️ Tag existed → deleting..."
-            curl -s -X DELETE \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              https://api.github.com/repos/${REPO}/git/refs/tags/${OUT_TAG}
-          fi
-
-      #
-      # ✅ Create new release (now allowed)
-      #
-      - name: Create output Release and upload assets
-        uses: softprops/action-gh-release@v2
+      # (Tuỳ chọn) Upload toàn bộ thư mục để debug
+      - name: Upload full patcher folder (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ env.OUT_TAG }}
-          name: Patched ${{ env.OUT_TAG }}
-          body: |
-            Auto-patched from source tag **${{ env.SRC_TAG }}**
-          files: |
-            outputs/*
-            outputs-${{ env.OUT_TAG }}.tar.gz
-
+          name: debug-framework_patcher-${{ env.OUT_TAG }}
+          path: framework_patcher/

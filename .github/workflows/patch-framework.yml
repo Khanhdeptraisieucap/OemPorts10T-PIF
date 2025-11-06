@@ -12,11 +12,10 @@ jobs:
   patch-and-release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # cần quyền tạo release & upload asset
+      contents: write   # cần để tạo release & upload asset
     env:
       SRC_TAG: ${{ github.event.inputs.tag }}
       REPO: ${{ github.repository }}
-      # Tag đầu ra: pif-{SRC_TAG}-run-{run_number} (mỗi lần chạy là 1 tag mới, hợp với chế độ immutable)
       OUT_TAG: pif-${{ github.event.inputs.tag }}-run-${{ github.run_number }}
 
     steps:
@@ -49,27 +48,52 @@ jobs:
         working-directory: framework_patcher
         run: |
           set -e
+          # Ghi mốc thời gian trước khi patch để lọc file mới sinh ra
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > ../_start_time
           ./patchframework.sh
-          echo "==== OUTPUTS ===="
-          ls -lh
+          echo "==== AFTER PATCH ===="
+          ls -lah
 
-      - name: Collect outputs
+      - name: Collect outputs (flexible)
         run: |
           set -e
-          shopt -s nullglob
+          START_TIME=$(cat _start_time)
           mkdir -p outputs
-          # đổi pattern này nếu script của bạn đặt tên khác
-          files=(framework_patcher/*patched*)
+
+          echo "Start time: $START_TIME"
+
+          # Lấy mọi file tạo/sửa sau khi patch (loại trừ input & script)
+          mapfile -t files < <(find framework_patcher -type f -newermt "$START_TIME" \
+                                ! -name "framework.jar" \
+                                ! -name "patchframework.sh" \
+                                ! -name "*.log" \
+                                ! -name "*.sh" 2>/dev/null)
+
+          # Fallback nếu mtime không khớp
           if [ ${#files[@]} -eq 0 ]; then
-            echo "❌ Không tìm thấy file đầu ra *patched* — hãy kiểm tra tên file output của patcher."
+            echo "⚠️  Không xác định được theo mốc thời gian, dùng fallback."
+            mapfile -t files < <(find framework_patcher -type f \
+                                  ! -name "framework.jar" \
+                                  ! -name "patchframework.sh" \
+                                  ! -name "*.log" 2>/dev/null)
+          fi
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "❌ Không tìm thấy file đầu ra. Danh sách file để debug:"
+            find framework_patcher -maxdepth 2 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort
             exit 1
           fi
-          cp "${files[@]}" outputs/
-          ls -lh outputs/
-          # Gói kèm theo một tar.gz cho tiện
+
+          echo "✅ Files to publish:"
+          printf '%s\n' "${files[@]}"
+
+          cp -v "${files[@]}" outputs/
+          ls -lah outputs
+
+          # Gói tiện dụng
           tar -czf outputs-${{ env.OUT_TAG }}.tar.gz -C outputs .
 
-      - name: Upload artifacts (for debugging / download)
+      - name: Upload artifacts (download/debug)
         uses: actions/upload-artifact@v4
         with:
           name: patched-${{ env.OUT_TAG }}
@@ -77,11 +101,17 @@ jobs:
             outputs/
             outputs-${{ env.OUT_TAG }}.tar.gz
 
+      - name: Upload full patcher folder (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-framework_patcher-${{ env.OUT_TAG }}
+          path: framework_patcher/
+
       - name: Create output Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.OUT_TAG }}
-          name: Patched ${ { env.OUT_TAG } }
+          name: Patched ${{ env.OUT_TAG }}
           body: |
             Auto-patched from source tag **${{ env.SRC_TAG }}**.
             This release is created by GitHub Actions.

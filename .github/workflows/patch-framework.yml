@@ -1,23 +1,21 @@
-name: Patch framework from Release → Artifact only (no Release)
+name: PIF Patch (Release asset → Patched JAR + NEW immutable Release)
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag Release nguồn chứa framework.jar (ví dụ: v1)'
+        description: 'Tag Release nguồn chứa framework.jar (vd: v1)'
         required: true
         default: 'v1'
 
 jobs:
-  patch-and-artifact:
+  patch:
     runs-on: ubuntu-latest
     permissions:
-      contents: read    # chỉ cần đọc để tải release nguồn
-      actions: read     # đọc danh sách artifact của run (để in URL)
+      contents: write   # tạo release mới & đọc release nguồn
+      actions: read
     env:
-      SRC_TAG: ${{ github.event.inputs.tag }}
       REPO: ${{ github.repository }}
-      OUT_TAG: pif-${{ github.event.inputs.tag }}-run-${{ github.run_number }}
 
     steps:
       - name: Checkout
@@ -26,9 +24,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y openjdk-17-jre zip unzip jq curl
+          # zipalign cần có trên runner
+          sudo apt-get install -y openjdk-17-jre zip unzip jq curl gdown p7zip-full zipalign
 
       - name: Download framework.jar from source Release
+        env:
+          SRC_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -e
           mkdir -p framework_patcher
@@ -38,103 +39,110 @@ jobs:
             echo "❌ Không tìm thấy asset framework.jar trong release tag ${SRC_TAG}"
             exit 1
           fi
-          echo "✅ Downloading: $asset_url"
+          echo "➡️  Downloading: $asset_url"
           curl -L "$asset_url" -o framework_patcher/framework.jar
           ls -lh framework_patcher/
 
       - name: Make patch script executable
         run: chmod +x framework_patcher/patchframework.sh
 
-      - name: Run patcher
+      - name: Run patcher (fail fast)
         working-directory: framework_patcher
         run: |
           set -e
-          # Ghi mốc thời gian để lọc file mới sinh
+          # mốc thời gian để lọc file mới
           date -u +"%Y-%m-%dT%H:%M:%SZ" > ../_start_time
-          ./patchframework.sh
+          bash -e ./patchframework.sh
           echo "==== AFTER PATCH ===="
           ls -lah
 
-      - name: Collect outputs (include patched JAR if modified + PIF module)
+      - name: Rebuild framework_patched.jar (fallback)
+        working-directory: framework_patcher
+        run: |
+          set -e
+          # Nếu script chỉ tạo classes.dex thì tự đóng gói lại JAR đã patch
+          if [ -f classes.dex ] && [ -f framework.jar ]; then
+            echo "🔧 Rebuilding framework_patched.jar from framework.jar + classes.dex"
+            cp -f framework.jar framework_patched.jar
+            zip -d framework_patched.jar 'classes*.dex' || true
+            zip -j framework_patched.jar classes.dex
+            ls -lh framework_patched.jar
+          else
+            echo "ℹ️ Không cần rebuild (script đã tạo JAR sẵn hoặc thiếu classes.dex)."
+          fi
+
+      - name: Collect outputs (grab patched JAR + modules)
         run: |
           set -e
           START_TIME=$(cat _start_time)
           mkdir -p outputs
 
-          echo "== List everything after patch for debugging =="
-          find framework_patcher -maxdepth 3 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort
-
-          # 1) Nếu framework.jar được CHỈNH SỬA sau khi chạy patcher -> lấy
-          if find framework_patcher -maxdepth 1 -type f -name "framework.jar" -newermt "$START_TIME" | grep -q . ; then
-            echo "✅ Detected patched framework.jar (modified after START_TIME)"
+          # Luôn ưu tiên lấy framework.jar (nếu tồn tại sau patch)
+          if [ -f framework_patcher/framework.jar ]; then
             cp -v framework_patcher/framework.jar outputs/framework_patched.jar
-          else
-            echo "ℹ️ framework.jar không thay đổi mtime sau khi patch (script có thể build module thay vì thay JAR)"
+          fi
+          # Nếu có file rebuild
+          if [ -f framework_patcher/framework_patched.jar ]; then
+            cp -v framework_patcher/framework_patched.jar outputs/framework_patched.jar
           fi
 
-          # 2) Gom ZIP module nếu có (ví dụ module sẵn sàng flash)
+          # Gom module ZIP (nếu script xuất)
           shopt -s nullglob
           mods=(framework_patcher/*.zip *.zip)
           if [ ${#mods[@]} -gt 0 ]; then
-            echo "✅ Found module ZIP(s):"
-            printf '%s\n' "${mods[@]}"
             cp -v "${mods[@]}" outputs/ || true
           fi
 
-          # 3) Gom thư mục PIF (module dạng thư mục) nếu có
+          # Đóng gói thư mục PIF nếu có
           if [ -d framework_patcher/PIF ]; then
-            echo "✅ Packing PIF/ module directory"
             (cd framework_patcher && zip -r ../outputs/PIF-module.zip PIF >/dev/null)
           fi
 
-          # 4) Thu thêm mọi file mới tạo/sửa (trừ script/log) để không bỏ sót gì
+          # Thu thêm file mới/sửa (trừ script/log) để không bỏ sót
           mapfile -t extras < <(find framework_patcher -type f -newermt "$START_TIME" \
                                   ! -name "patchframework.sh" \
                                   ! -name "*.log" 2>/dev/null)
           if [ ${#extras[@]} -gt 0 ]; then
-            echo "ℹ️ Extra new/modified files:"
-            printf '%s\n' "${extras[@]}"
             cp -vu "${extras[@]}" outputs/ || true
           fi
 
           echo "== OUTPUTS =="
           ls -lah outputs
-          tar -czf outputs-${{ env.OUT_TAG }}.tar.gz -C outputs .
 
-      - name: Upload artifacts (download from this run)
+      - name: Package (tar.gz)
+        id: pkg
+        run: |
+          set -e
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          OUT_TAG="pif-${{ github.event.inputs.tag }}-${TS}-r${{ github.run_id }}"
+          echo "tag=$OUT_TAG"  >> $GITHUB_OUTPUT
+          echo "name=Patched $OUT_TAG" >> $GITHUB_OUTPUT
+          tar -czf outputs-${OUT_TAG}.tar.gz -C outputs .
+          echo "tar=outputs-${OUT_TAG}.tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: patched-${{ env.OUT_TAG }}
+          name: patched-${{ steps.pkg.outputs.tag }}
           path: |
             outputs/
-            outputs-${{ env.OUT_TAG }}.tar.gz
-          if-no-files-found: error
+            ${{ steps.pkg.outputs.tar }}
           retention-days: 30
+          if-no-files-found: error
 
-      - name: Print direct Artifact URL
+      # Tạo RELEASE mới với tag duy nhất (tương thích Immutable Releases)
+      - name: Create immutable Release (unique tag per run)
+        uses: softprops/action-gh-release@v2
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          run_id=${{ github.run_id }}
-          repo=${{ github.repository }}
-          # Lấy artifact id theo đúng tên
-          resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                 "https://api.github.com/repos/$repo/actions/runs/$run_id/artifacts")
-          art_id=$(echo "$resp" | jq -r --arg NAME "patched-${OUT_TAG}" '.artifacts[] | select(.name==$NAME) | .id')
-          if [ -n "$art_id" ] && [ "$art_id" != "null" ]; then
-            echo ""
-            echo "================ ARTIFACT DOWNLOAD LINK ================"
-            echo "👉  https://github.com/$repo/actions/runs/$run_id/artifacts/$art_id"
-            echo "========================================================"
-            echo ""
-          else
-            echo "⚠️ Không tìm thấy artifact id để in URL. Vào tab Actions của run này để tải."
-          fi
-
-      # (Tuỳ chọn) Upload toàn bộ thư mục để debug
-      - name: Upload full patcher folder (debug)
-        if: always()
-        uses: actions/upload-artifact@v4
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: debug-framework_patcher-${{ env.OUT_TAG }}
-          path: framework_patcher/
+          tag_name:  ${{ steps.pkg.outputs.tag }}
+          name:      ${{ steps.pkg.outputs.name }}
+          body: |
+            Auto-patched from workflow run ${{ github.run_id }}.
+            Tag is unique to comply with immutable releases.
+          draft: false
+          prerelease: false
+          files: |
+            outputs/*
+            ${{ steps.pkg.outputs.tar }}

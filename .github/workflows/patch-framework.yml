@@ -55,42 +55,52 @@ jobs:
           echo "==== AFTER PATCH ===="
           ls -lah
 
-      - name: Collect outputs (flexible)
-        run: |
+            - name: Collect outputs (include patched JAR if modified + PIF module)
+          run: |
           set -e
           START_TIME=$(cat _start_time)
           mkdir -p outputs
 
-          # Lấy mọi file tạo/sửa sau khi patch (loại trừ input & script)
-          mapfile -t files < <(find framework_patcher -type f -newermt "$START_TIME" \
-                                ! -name "framework.jar" \
-                                ! -name "patchframework.sh" \
-                                ! -name "*.log" \
-                                ! -name "*.sh" 2>/dev/null)
+          echo "== List everything after patch for debugging =="
+          find framework_patcher -maxdepth 3 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort
 
-          # Fallback nếu mtime không khớp
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "⚠️  Fallback: quét toàn bộ thư mục."
-            mapfile -t files < <(find framework_patcher -type f \
-                                  ! -name "framework.jar" \
+          # 1) Nếu framework.jar được CHỈNH SỬA sau khi chạy patcher -> lấy
+          if find framework_patcher -maxdepth 1 -type f -name "framework.jar" -newermt "$START_TIME" | grep -q . ; then
+            echo "✅ Detected patched framework.jar (modified after START_TIME)"
+            cp -v framework_patcher/framework.jar outputs/framework_patched.jar
+          else
+            echo "ℹ️ framework.jar không thay đổi mtime sau khi patch (script có thể build module thay vì thay JAR)"
+          fi
+
+          # 2) Gom ZIP module nếu có (ví dụ module sẵn sàng flash)
+          shopt -s nullglob
+          mods=(framework_patcher/*.zip *.zip)
+          if [ ${#mods[@]} -gt 0 ]; then
+            echo "✅ Found module ZIP(s):"
+            printf '%s\n' "${mods[@]}"
+            cp -v "${mods[@]}" outputs/ || true
+          fi
+
+          # 3) Gom thư mục PIF (module dạng thư mục) nếu có
+          if [ -d framework_patcher/PIF ]; then
+            echo "✅ Packing PIF/ module directory"
+            (cd framework_patcher && zip -r ../outputs/PIF-module.zip PIF >/dev/null)
+          fi
+
+          # 4) Thu thêm mọi file mới tạo/sửa (trừ script/log) để không bỏ sót gì
+          mapfile -t extras < <(find framework_patcher -type f -newermt "$START_TIME" \
                                   ! -name "patchframework.sh" \
                                   ! -name "*.log" 2>/dev/null)
+          if [ ${#extras[@]} -gt 0 ]; then
+            echo "ℹ️ Extra new/modified files:"
+            printf '%s\n' "${extras[@]}"
+            cp -vu "${extras[@]}" outputs/ || true
           fi
 
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "❌ Không tìm thấy file đầu ra."
-            find framework_patcher -maxdepth 2 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort
-            exit 1
-          fi
-
-          echo "✅ Files to publish:"
-          printf '%s\n' "${files[@]}"
-
-          cp -v "${files[@]}" outputs/
+          echo "== OUTPUTS =="
           ls -lah outputs
-
-          # Gói thêm 1 bản tar.gz cho tiện tải 1 file
           tar -czf outputs-${{ env.OUT_TAG }}.tar.gz -C outputs .
+
 
       - name: Upload artifacts (download from this run)
         uses: actions/upload-artifact@v4

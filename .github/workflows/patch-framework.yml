@@ -1,0 +1,92 @@
+name: Patch framework from Release → Create output Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag Release nguồn chứa framework.jar (ví dụ: v1)'
+        required: true
+        default: 'v1'
+
+jobs:
+  patch-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # cần quyền tạo release & upload asset
+    env:
+      SRC_TAG: ${{ github.event.inputs.tag }}
+      REPO: ${{ github.repository }}
+      # Tag đầu ra: pif-{SRC_TAG}-run-{run_number} (mỗi lần chạy là 1 tag mới, hợp với chế độ immutable)
+      OUT_TAG: pif-${{ github.event.inputs.tag }}-run-${{ github.run_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre zip unzip jq curl
+
+      - name: Download framework.jar from source Release
+        run: |
+          set -e
+          mkdir -p framework_patcher
+          api_url="https://api.github.com/repos/${REPO}/releases/tags/${SRC_TAG}"
+          asset_url=$(curl -s "$api_url" | jq -r '.assets[] | select(.name=="framework.jar") | .browser_download_url')
+          if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
+            echo "❌ Không tìm thấy asset framework.jar trong release tag ${SRC_TAG}"
+            exit 1
+          fi
+          echo "✅ Downloading: $asset_url"
+          curl -L "$asset_url" -o framework_patcher/framework.jar
+          ls -lh framework_patcher/
+
+      - name: Make patch script executable
+        run: chmod +x framework_patcher/patchframework.sh
+
+      - name: Run patcher
+        working-directory: framework_patcher
+        run: |
+          set -e
+          ./patchframework.sh
+          echo "==== OUTPUTS ===="
+          ls -lh
+
+      - name: Collect outputs
+        run: |
+          set -e
+          shopt -s nullglob
+          mkdir -p outputs
+          # đổi pattern này nếu script của bạn đặt tên khác
+          files=(framework_patcher/*patched*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "❌ Không tìm thấy file đầu ra *patched* — hãy kiểm tra tên file output của patcher."
+            exit 1
+          fi
+          cp "${files[@]}" outputs/
+          ls -lh outputs/
+          # Gói kèm theo một tar.gz cho tiện
+          tar -czf outputs-${{ env.OUT_TAG }}.tar.gz -C outputs .
+
+      - name: Upload artifacts (for debugging / download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-${{ env.OUT_TAG }}
+          path: |
+            outputs/
+            outputs-${{ env.OUT_TAG }}.tar.gz
+
+      - name: Create output Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.OUT_TAG }}
+          name: Patched ${ { env.OUT_TAG } }
+          body: |
+            Auto-patched from source tag **${{ env.SRC_TAG }}**.
+            This release is created by GitHub Actions.
+          draft: false
+          prerelease: false
+          files: |
+            outputs/*
+            outputs-${{ env.OUT_TAG }}.tar.gz
